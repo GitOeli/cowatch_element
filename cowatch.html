@@ -5,39 +5,61 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Watch together</title>
 <style>
-  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --line:#d9d9e0; --accent:#0a7d5a; }
+  :root { --bg:#ffffff; --surface:#f3f4f7; --fg:#16181d; --muted:#6a6f7c; --line:#dfe2e8;
+          --accent:#0b7a5b; --accent-fg:#ffffff; --dot-idle:#b4b8c2; --dot-ok:#1fa971; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#15171a; --fg:#e8e8ec; --muted:#9a9aa6; --line:#2c2f35; --accent:#3ecf9e; }
+    :root { --bg:#14161a; --surface:#1d2025; --fg:#eceef2; --muted:#9aa0ad; --line:#2a2e35;
+            --accent:#3ecf9e; --accent-fg:#0c1f18; --dot-idle:#5a6070; --dot-ok:#3ecf9e; }
   }
   * { box-sizing: border-box; }
   html, body { height:100%; margin:0; }
   body { display:flex; flex-direction:column; background:var(--bg); color:var(--fg);
-         font:15px/1.4 system-ui, sans-serif; }
-  form { display:flex; gap:8px; padding:8px; border-bottom:1px solid var(--line); }
-  input { flex:1; min-width:0; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
-          background:var(--bg); color:var(--fg); font:inherit; }
-  button { padding:8px 14px; border:0; border-radius:6px; background:var(--accent);
-           color:var(--bg); font:inherit; font-weight:600; cursor:pointer; }
+         font:15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px;
+           padding:10px 14px; }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:650; letter-spacing:.01em; }
+  .logo { display:inline-grid; place-items:center; width:26px; height:26px; border-radius:8px;
+          background:var(--accent); color:var(--accent-fg); font-size:11px; padding-left:2px; }
+  #status { display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:999px;
+            background:var(--surface); color:var(--muted); font-size:13px; min-width:0; }
+  #statusText { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dot { flex:none; width:8px; height:8px; border-radius:50%; background:var(--dot-idle); }
+  #status.live .dot { background:var(--dot-ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--dot-ok) 25%, transparent); }
+  form { display:flex; gap:8px; padding:0 14px 12px; }
+  input { flex:1; min-width:0; padding:10px 16px; border:1px solid var(--line); border-radius:999px;
+          background:var(--surface); color:var(--fg); font:inherit; }
+  input::placeholder { color:var(--muted); }
+  button { padding:10px 18px; border:0; border-radius:999px; background:var(--accent);
+           color:var(--accent-fg); font:inherit; font-weight:650; cursor:pointer; white-space:nowrap; }
+  button:hover { filter:brightness(1.08); }
   button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-  #stage { position:relative; flex:1; min-height:0; background:#000; }
-  #player { position:absolute; inset:0; width:100%; height:100%; }
-  #join { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-          background:rgba(0,0,0,.75); z-index:2; }
-  #join[hidden] { display:none; }
-  #status { padding:6px 10px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); }
+  #stage { position:relative; flex:1; min-height:0; margin:0 14px 14px; border-radius:14px;
+           overflow:hidden; background:#000; }
+  #player { position:absolute; inset:0; width:100%; height:100%; border:0; }
+  #empty { position:absolute; inset:0; z-index:1; display:flex; flex-direction:column;
+           align-items:center; justify-content:center; gap:6px; text-align:center; padding:24px;
+           background:var(--surface); color:var(--muted); pointer-events:none; }
+  #empty[hidden], #join[hidden] { display:none; }
+  #empty strong { color:var(--fg); font-size:17px; }
+  #join { position:absolute; inset:0; z-index:2; display:flex; align-items:center;
+          justify-content:center; background:rgba(8,10,12,.78); backdrop-filter:blur(4px); }
+  #join button { padding:14px 26px; font-size:16px; }
 </style>
 </head>
 <body>
+<header>
+  <div class="brand"><span class="logo" aria-hidden="true">&#9654;</span><span>Watch together</span></div>
+  <div id="status" role="status"><span class="dot"></span><span id="statusText">Starting&hellip;</span></div>
+</header>
 <form id="load">
   <input id="url" type="url" placeholder="Paste a YouTube link" aria-label="YouTube link" required>
   <button type="submit">Play for everyone</button>
 </form>
 <div id="stage">
+  <div id="empty"><strong>Nothing playing yet</strong><span>Paste a YouTube link above to start for the whole room.</span></div>
   <div id="player"></div>
   <div id="join"><button id="joinBtn" type="button">Join the watch party</button></div>
 </div>
-<div id="status">Starting…</div>
-
 <script>
 (function () {
   'use strict';
@@ -52,9 +74,14 @@
   var parentOrigin = '*';
   try { parentOrigin = new URL(params.get('parentUrl')).origin; } catch (e) {}
 
-  var $status = document.getElementById('status');
+  var $status = document.getElementById('statusText');
+  var $statusBox = document.getElementById('status');
+  var $empty = document.getElementById('empty');
   var $join = document.getElementById('join');
-  function say(t) { $status.textContent = t; }
+  function say(t) {
+    $status.textContent = t;
+    $statusBox.classList.toggle('live', /^(Playing|Paused|Connected)/.test(t));
+  }
 
   /* ---------- Matrix widget transport (postMessage protocol) ---------- */
   var reqCount = 0;
@@ -149,6 +176,7 @@
     programmatic(function () {
       if (s.videoId !== current.videoId) {
         current.videoId = s.videoId;
+        $empty.hidden = true;
         if (s.playing && joined) player.loadVideoById(s.videoId, target);
         else player.cueVideoById(s.videoId, target);
       } else {
@@ -234,6 +262,7 @@
     if (!id) { say('That does not look like a YouTube link.'); return; }
     if (!joined) { joined = true; $join.hidden = true; }
     current.videoId = id;
+    $empty.hidden = true;
     programmatic(function () { player.loadVideoById(id, 0); });
     lastT = 0; lastWall = Date.now();
     isLeader = true;
