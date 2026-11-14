@@ -69,12 +69,15 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.4 (lockstep: everyone waits for ads, 2026-11-14)';
+  var VERSION = '1.5 (low-traffic lockstep, 2026-11-14)';
   document.getElementById('ver').textContent = 'v' + VERSION.split(' ')[0];
   document.getElementById('ver').title = 'Widget version ' + VERSION;
+
   var EVENT_TYPE = 'io.cowatch.sync';
-  var DRIFT_LIMIT = 1.5;       // seconds before we correct a client
-  var HEARTBEAT_MS = 5000;     // leader re-broadcasts position this often
+  var DRIFT_LIMIT = 1.5;        // seconds of drift tolerated on heartbeat-free corrections
+  var PENDING_MS = 6000;        // how long we wait for peers to load a new video
+  var BUCKET_MAX = 6, BUCKET_REFILL_MS = 4000;   // Synapse default: burst 10, 1 per 5 s
+  var PEER_TTL = 20 * 60 * 1000;
   var me = Math.random().toString(36).slice(2);
 
   var params = new URLSearchParams(location.search);
@@ -92,31 +95,74 @@
     $statusBox.classList.toggle('live', /^(Playing|Paused|Connected)/.test(t));
   }
 
-  /* ---------- Matrix widget transport (postMessage protocol) ---------- */
-  var reqCount = 0;
+  /* ---------- Matrix widget transport ---------- */
+  var reqCount = 0, inflight = {}, queue = [];
+  var sendTimer = null, backoffUntil = 0;
+  var tokens = BUCKET_MAX, tokenAt = Date.now();
+  function refill() {
+    var now = Date.now();
+    tokens = Math.min(BUCKET_MAX, tokens + (now - tokenAt) / BUCKET_REFILL_MS);
+    tokenAt = now;
+  }
 
   function toClient(msg) { window.parent.postMessage(msg, parentOrigin); }
 
   function request(action, data) {
-    toClient({ api: 'fromWidget', widgetId: widgetId,
-               requestId: 'w' + (++reqCount) + '-' + me, action: action, data: data || {} });
+    var id = 'w' + (++reqCount) + '-' + me;
+    toClient({ api: 'fromWidget', widgetId: widgetId, requestId: id, action: action, data: data || {} });
+    return id;
   }
 
+  // Every outgoing event goes through this queue: a small burst is allowed, then one
+  // event per BUCKET_REFILL_MS, and only the newest 'state' and 'info' are kept.
   function sendSync(content) {
     content.sender = me;
     content.ts = Date.now();
-    request('send_event', { type: EVENT_TYPE, content: content });
+    if (content.kind === 'state' || content.kind === 'info') {
+      queue = queue.filter(function (q) { return q.kind !== content.kind; });
+    }
+    queue.push(content);
+    pump();
+  }
+
+  function pump() {
+    if (sendTimer || !queue.length) return;
+    var now = Date.now();
+    refill();
+    var wait = Math.max(tokens >= 1 ? 0 : (1 - tokens) * BUCKET_REFILL_MS, backoffUntil - now);
+    sendTimer = setTimeout(function () {
+      sendTimer = null;
+      var i = 0;
+      for (var k = 0; k < queue.length; k++) {           // control messages first
+        if (queue[k].kind === 'state' || queue[k].kind === 'hello') { i = k; break; }
+      }
+      var c = queue.splice(i, 1)[0];
+      refill(); tokens -= 1;
+      inflight[request('send_event', { type: EVENT_TYPE, content: c })] = c;
+      pump();
+    }, wait);
   }
 
   window.addEventListener('message', function (ev) {
     if (ev.source !== window.parent) return;
     var m = ev.data;
-    if (!m || m.api !== 'toWidget' || m.widgetId !== widgetId || m.response) return;
+    if (!m || m.widgetId !== widgetId) return;
 
-    var reply = function (response) {
-      m.response = response;
-      toClient(m);
-    };
+    if (m.api === 'fromWidget') {                         // answer to something we sent
+      var c = inflight[m.requestId];
+      if (c && m.response) {
+        delete inflight[m.requestId];
+        if (m.response.error) {
+          backoffUntil = Date.now() + 8000;
+          if (!c.retried) { c.retried = true; queue.unshift(c); pump(); }
+          say('Server is limiting messages, slowing down\u2026');
+        }
+      }
+      return;
+    }
+    if (m.api !== 'toWidget' || m.response) return;
+
+    var reply = function (response) { m.response = response; toClient(m); };
 
     if (m.action === 'capabilities') {
       reply({ capabilities: [
@@ -130,26 +176,27 @@
     } else if (m.action === 'send_event') {
       reply({});
       var e = m.data;
-      if (e && e.type === EVENT_TYPE && e.content && e.content.sender !== me) {
-        onRemote(e.content);
-      }
+      if (e && e.type === EVENT_TYPE && e.content && e.content.sender !== me) onRemote(e.content);
     } else {
       reply({});
     }
   });
 
-  /* ---------- YouTube player ---------- */
-  var player = null, playerReady = false, pending = null;
-  var joined = false;
-  var suppressUntil = 0;       // ignore player events we caused ourselves
-  var isLeader = false;        // last client to issue a control action
+  window.addEventListener('pagehide', function () {
+    request('send_event', { type: EVENT_TYPE, content: { kind: 'bye', sender: me, ts: Date.now() } });
+  });
+
+  /* ---------- Player state ---------- */
+  var player = null, playerReady = false, pendingState = null;
+  var joined = false, errored = false;
+  var suppressUntil = 0;
+  var isLeader = false;
   var lastT = 0, lastWall = Date.now();
-  var current = { videoId: null, rate: 1 };
-  var sharedPlaying = false;   // last play/pause state agreed with the room
-  var lastDur = 0;             // used to spot ads (duration suddenly changes)
-  var resyncTimer = null, resyncTries = 0;
-  var peers = {};              // other viewers' last heartbeat
-  var hold = false, holdSince = 0, readyAllSince = 0, wasReady = true, errored = false, lastHbDur = 0;
+  var current = { videoId: null };
+  var sharedPlaying = false;
+  var peers = {};                 // sender -> last 'info' message
+  var hold = false, holdSince = 0, readyAllSince = 0, loadAt = 0, wasReady = true;
+  var lastInfo = '', helloTimer = null, replyTimer = null;
 
   function parseVideoId(s) {
     var m = s.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([\w-]{11})/);
@@ -157,10 +204,9 @@
     return /^[\w-]{11}$/.test(s.trim()) ? s.trim() : null;
   }
 
-  function programmatic(fn) {
-    suppressUntil = Date.now() + 1500;
-    fn();
-  }
+  function programmatic(fn) { suppressUntil = Date.now() + 1500; fn(); }
+  function myDur() { return playerReady ? player.getDuration() : 0; }
+  function isIdle() { return !playerReady || !current.videoId || errored || !joined; }
 
   function snapshot() {
     var st = playerReady ? player.getPlayerState() : -1;
@@ -169,47 +215,76 @@
       playing: st === 1 || st === 3,
       pos: playerReady ? player.getCurrentTime() : 0,
       rate: playerReady ? player.getPlaybackRate() : 1,
-      dur: playerReady ? player.getDuration() : 0
+      dur: myDur()
     };
   }
 
-  function broadcastState(kind) {
+  /* ---------- Who is ready? ---------- */
+  // Ads are shorter than the video, so the longest length anyone reports is the real one.
+  function alivePeers() {
+    var now = Date.now(), out = [];
+    Object.keys(peers).forEach(function (id) {
+      var p = peers[id];
+      if (now - p.seen > PEER_TTL || p.idle) return;
+      p.id = id; out.push(p);
+    });
+    return out;
+  }
+
+  function contentDur(sameVideo) {
+    var m = myDur();
+    sameVideo.forEach(function (p) { if (p.dur > m) m = p.dur; });
+    return m;
+  }
+
+  function close(a, b) { return a > 0 && Math.abs(a - b) <= 1.5; }
+
+  function isReady() {
+    if (isIdle()) return true;
+    var same = alivePeers().filter(function (p) { return p.videoId === current.videoId; });
+    return close(myDur(), contentDur(same));
+  }
+
+  function sendInfo() {
+    sendSync({ kind: 'info', videoId: current.videoId, dur: myDur(),
+               idle: !playerReady || errored || !joined, hold: hold });
+  }
+
+  /* ---------- Sending room-wide state ---------- */
+  function broadcastState() {
     var s = snapshot();
     if (!s.videoId || !isReady()) return;
     isLeader = true;
-    s.kind = kind || 'state';
+    s.kind = 'state';
     sharedPlaying = s.playing;
     sendSync(s);
   }
 
   function applyState(s) {
-    if (!playerReady) { pending = s; return; }
+    if (!playerReady) { pendingState = s; return; }
     if (!s.videoId) return;
-    // If our video length differs from the sender's, one of us is watching an ad.
-    // Ignore the message and ask again shortly instead of jumping around.
-    if (s.videoId === current.videoId) {
-      var myDur = player.getDuration();
-      if (myDur > 0 && s.dur > 0 && Math.abs(myDur - s.dur) > 1.5) {
-        if (resyncTries++ < 30) requestResync(2000);
-        return;
-      }
+    var isNew = s.videoId !== current.videoId;
+    if (!isNew) {
+      var d = myDur();
+      if (d > 0 && s.dur > 0 && Math.abs(d - s.dur) > 1.5) return;   // we or they are in an ad
     }
-    resyncTries = 0;
-    hold = false; readyAllSince = 0;
-    // Estimate where the sender is now, if they were playing.
     var target = s.pos;
     if (s.playing && s.recvAt) target += (Date.now() - s.recvAt) / 1000 * s.rate;
 
+    hold = false; readyAllSince = 0;
     programmatic(function () {
-      if (s.videoId !== current.videoId) {
+      if (isNew) {
         current.videoId = s.videoId;
         errored = false;
-        lastDur = 0;
+        loadAt = Date.now();
         $empty.hidden = true;
-        if (s.playing && joined) player.loadVideoById(s.videoId, target);
-        else player.cueVideoById(s.videoId, target);
+        if (s.playing && joined) {
+          player.loadVideoById(s.videoId, target);
+          hold = true; holdSince = Date.now();            // start together, not whenever we load
+        } else {
+          player.cueVideoById(s.videoId, target);
+        }
       } else {
-        // Explicit play/pause/resume messages align tightly; heartbeats tolerate more drift.
         var limit = s.kind === 'state' ? 0.4 : DRIFT_LIMIT;
         if (Math.abs(player.getCurrentTime() - target) > limit) player.seekTo(target, true);
         if (player.getPlaybackRate() !== s.rate) player.setPlaybackRate(s.rate);
@@ -220,22 +295,30 @@
     });
     lastT = target; lastWall = Date.now();
     sharedPlaying = s.playing;
-    say(s.playing ? 'Playing in sync' : 'Paused');
+    if (!hold) say(s.playing ? 'Playing in sync' : 'Paused');
   }
 
   function onRemote(c) {
     c.recvAt = Date.now();
+    if (c.kind === 'hello' || c.kind === 'state') {
+      var pr = peers[c.sender];
+      if (!pr) pr = peers[c.sender] = { videoId: null, dur: 0, idle: false, hold: false };
+      pr.seen = c.recvAt;
+      if (c.kind === 'state') { pr.videoId = c.videoId; if (c.dur > 0) pr.dur = c.dur; pr.hold = false; }
+    }
     if (c.kind === 'hello') {
-      // Anyone who is ready and not waiting answers, staggered to limit duplicates.
+      // One late, random answer from whoever is ready; cancelled if someone else answers first.
       if (current.videoId && !hold && isReady()) {
-        setTimeout(function () { broadcastState('state'); }, Math.random() * 800);
+        clearTimeout(replyTimer);
+        replyTimer = setTimeout(function () { broadcastState(); }, 400 + Math.random() * 1200);
       }
-    } else if (c.kind === 'hb') {
+    } else if (c.kind === 'info') {
       c.seen = c.recvAt;
       peers[c.sender] = c;
-      // The leader's heartbeat also corrects drift, but never breaks a wait.
-      if (c.lead && c.playing && !hold && !isIdle()) applyState(c);
+    } else if (c.kind === 'bye') {
+      delete peers[c.sender];
     } else if (c.kind === 'state') {
+      clearTimeout(replyTimer);
       isLeader = false;
       applyState(c);
     }
@@ -248,18 +331,16 @@
       events: {
         onReady: function () {
           playerReady = true;
-          if (pending) { var p = pending; pending = null; applyState(p); }
+          if (pendingState) { var p = pendingState; pendingState = null; applyState(p); }
         },
         onStateChange: function (e) {
           if (hold || Date.now() < suppressUntil) return;
-          // Only a real play/pause change is shared. Buffering or an ad ending
-          // fires 'playing' again, and must not reset everyone.
-          if (e.data === 1 && !sharedPlaying) broadcastState('state');
-          else if (e.data === 2 && sharedPlaying) broadcastState('state');
+          if (e.data === 1 && !sharedPlaying) broadcastState();
+          else if (e.data === 2 && sharedPlaying) broadcastState();
         },
         onPlaybackRateChange: function () {
           if (hold || Date.now() < suppressUntil) return;
-          broadcastState('state');
+          broadcastState();
         },
         onError: function (e) {
           errored = true;
@@ -275,71 +356,23 @@
   setInterval(function () {
     if (!playerReady || !current.videoId) return;
     var now = Date.now();
-    var st = player.getPlayerState();
-    var playing = st === 1;
+    var playing = player.getPlayerState() === 1;
     var expected = lastT + (playing ? (now - lastWall) / 1000 * player.getPlaybackRate() : 0);
     var actual = player.getCurrentTime();
-    if (hold) { lastT = actual; lastWall = now; return; }
-    if (now > suppressUntil && Math.abs(actual - expected) > DRIFT_LIMIT) broadcastState('state');
+    if (!hold && now > suppressUntil && Math.abs(actual - expected) > DRIFT_LIMIT) broadcastState();
     lastT = actual; lastWall = now;
   }, 500);
 
-  function requestResync(delay) {
-    clearTimeout(resyncTimer);
-    resyncTimer = setTimeout(function () { sendSync({ kind: 'hello' }); }, delay || 1000);
-  }
-
   /* ---------- Lockstep: nobody plays ahead of anybody ---------- */
-  var HB_MS = 6000;            // Synapse rate-limits message events, keep this slow
-  var ALIVE_MS = 15000;
-
-  function myDur() { return playerReady ? player.getDuration() : 0; }
-
-  function alivePeers() {
-    var now = Date.now(), out = [];
-    Object.keys(peers).forEach(function (id) {
-      var p = peers[id];
-      if (now - p.seen < ALIVE_MS && !p.idle && p.videoId === current.videoId) { p.id = id; out.push(p); }
-    });
-    return out;
-  }
-
-  // Ads are shorter than the video, so the longest length anyone reports is the real one.
-  function contentDur() {
-    var m = myDur();
-    alivePeers().forEach(function (p) { if (p.dur > m) m = p.dur; });
-    return m;
-  }
-
-  function isIdle() { return !playerReady || !current.videoId || errored || !joined; }
-
-  function isReady() {
-    if (isIdle()) return true;
-    var d = myDur();
-    return d > 0 && Math.abs(d - contentDur()) <= 1.5;
-  }
-
-  function sendHb() {
-    var s = snapshot();
-    s.kind = 'hb';
-    s.idle = isIdle();
-    s.ready = isReady();
-    s.hold = hold;
-    s.lead = isLeader;
-    sendSync(s);
-  }
-  setInterval(sendHb, HB_MS);
-
   function doResume() {
     hold = false; readyAllSince = 0; $skip.hidden = true;
-    var s = snapshot();                       // our own paused position
+    var s = snapshot();                          // our own paused position
     programmatic(function () { player.playVideo(); });
     s.playing = true; s.kind = 'state';
     sharedPlaying = true; isLeader = true;
     sendSync(s);
     lastT = s.pos; lastWall = Date.now();
     say('Playing in sync');
-    sendHb();
   }
 
   function tick() {
@@ -347,31 +380,37 @@
     var now = Date.now();
     if (isIdle()) { hold = false; $skip.hidden = true; return; }
 
-    // Tell the room as soon as our video length is known or changes (ad start/end).
-    var d = myDur();
-    if (d !== lastHbDur) { lastHbDur = d; sendHb(); }
-
     var st = player.getPlayerState();
-    var ready = isReady();
-    var others = alivePeers();
-    var waiting = others.filter(function (p) { return !p.ready; }).length + (ready ? 0 : 1);
-    var anyHold = others.some(function (p) { return p.hold; });
+    var all = alivePeers();
+    var same = all.filter(function (p) { return p.videoId === current.videoId; });
+    var cd = contentDur(same);
+    var ready = close(myDur(), cd);
+    var unready = same.filter(function (p) { return !close(p.dur, cd); }).length + (ready ? 0 : 1);
+    // Peers that have not yet reported this video are still loading it.
+    var loading = now - loadAt < PENDING_MS
+      ? all.filter(function (p) { return p.videoId !== current.videoId; }).length : 0;
+    var waiting = unready + loading;
+    var anyHold = same.some(function (p) { return p.hold; });
+
+    // Tell the room only when something about us changed.
+    var sig = [current.videoId, Math.round(myDur()), hold].join('|');
+    if (sig !== lastInfo) { lastInfo = sig; sendInfo(); }
 
     if (ready !== wasReady) {
       wasReady = ready;
-      // We just came out of an ad while the room kept playing: catch up, do not lead.
-      if (ready && !hold && !anyHold) requestResync(300);
-      sendHb();
+      // We came out of an ad while the room kept playing: ask once, do not lead.
+      if (ready && !hold && !anyHold && same.length) {
+        clearTimeout(helloTimer);
+        helloTimer = setTimeout(function () { sendSync({ kind: 'hello' }); }, 300);
+      }
     }
 
-    if (!hold && others.length > 0 && waiting > 0 && sharedPlaying && (st === 1 || st === 3)) {
+    if (!hold && waiting > 0 && all.length > 0 && sharedPlaying && (st === 1 || st === 3)) {
       hold = true; holdSince = now;
-      sendHb();
     }
-
     if (!hold) { readyAllSince = 0; $skip.hidden = true; return; }
 
-    // Holding: pause (we cannot pause an ad, so only once we are past it).
+    // Holding: pause. (An ad cannot be paused, so we only pause once we are past it.)
     if (ready && (st === 1 || st === 3)) programmatic(function () { player.pauseVideo(); });
 
     if (waiting > 0) {
@@ -379,9 +418,9 @@
       say('Waiting for ' + waiting + ' viewer' + (waiting > 1 ? 's' : '') + ' (ad or loading)\u2026');
     } else {
       if (!readyAllSince) readyAllSince = now;
-      if (now - readyAllSince > 700) {
+      if (now - readyAllSince > (all.length ? 700 : 0)) {
         var ids = [me];
-        others.forEach(function (p) { if (p.hold) ids.push(p.id); });
+        same.forEach(function (p) { if (p.hold) ids.push(p.id); });
         ids.sort();
         if (ids[0] === me || now - readyAllSince > 5000) doResume();
         else say('Starting together\u2026');
@@ -397,9 +436,7 @@
   document.getElementById('joinBtn').addEventListener('click', function () {
     joined = true;                 // a user gesture lets the browser allow playback
     $join.hidden = true;
-    if (playerReady && current.videoId) {
-      programmatic(function () { player.playVideo(); });
-    }
+    if (playerReady && current.videoId) programmatic(function () { player.playVideo(); });
   });
 
   document.getElementById('load').addEventListener('submit', function (e) {
@@ -408,15 +445,15 @@
     if (!id) { say('That does not look like a YouTube link.'); return; }
     if (!joined) { joined = true; $join.hidden = true; }
     current.videoId = id;
-    lastDur = 0;
-    errored = false; hold = false;
-    sharedPlaying = true;
+    errored = false;
+    loadAt = Date.now();
+    hold = true; holdSince = loadAt; readyAllSince = 0;   // everyone starts together
+    sharedPlaying = true; isLeader = true;
     $empty.hidden = true;
     programmatic(function () { player.loadVideoById(id, 0); });
     lastT = 0; lastWall = Date.now();
-    isLeader = true;
-    sendSync({ kind: 'state', videoId: id, playing: true, pos: 0, rate: 1 });
-    say('Playing for everyone');
+    sendSync({ kind: 'state', videoId: id, playing: true, pos: 0, rate: 1, dur: 0 });
+    say('Starting for everyone\u2026');
   });
 
   /* ---------- Boot ---------- */
