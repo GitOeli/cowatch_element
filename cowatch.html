@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch together</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --line:#d9d9e0; --accent:#0a7d5a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15171a; --fg:#e8e8ec; --muted:#9a9aa6; --line:#2c2f35; --accent:#3ecf9e; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; }
+  body { display:flex; flex-direction:column; background:var(--bg); color:var(--fg);
+         font:15px/1.4 system-ui, sans-serif; }
+  form { display:flex; gap:8px; padding:8px; border-bottom:1px solid var(--line); }
+  input { flex:1; min-width:0; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
+          background:var(--bg); color:var(--fg); font:inherit; }
+  button { padding:8px 14px; border:0; border-radius:6px; background:var(--accent);
+           color:var(--bg); font:inherit; font-weight:600; cursor:pointer; }
+  button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; }
+  #player { position:absolute; inset:0; width:100%; height:100%; }
+  #join { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          background:rgba(0,0,0,.75); z-index:2; }
+  #join[hidden] { display:none; }
+  #status { padding:6px 10px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); }
+</style>
+</head>
+<body>
+<form id="load">
+  <input id="url" type="url" placeholder="Paste a YouTube link" aria-label="YouTube link" required>
+  <button type="submit">Play for everyone</button>
+</form>
+<div id="stage">
+  <div id="player"></div>
+  <div id="join"><button id="joinBtn" type="button">Join the watch party</button></div>
+</div>
+<div id="status">Starting…</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var EVENT_TYPE = 'io.cowatch.sync';
+  var DRIFT_LIMIT = 1.5;       // seconds before we correct a client
+  var HEARTBEAT_MS = 5000;     // leader re-broadcasts position this often
+  var me = Math.random().toString(36).slice(2);
+
+  var params = new URLSearchParams(location.search);
+  var widgetId = params.get('widgetId');
+  var parentOrigin = '*';
+  try { parentOrigin = new URL(params.get('parentUrl')).origin; } catch (e) {}
+
+  var $status = document.getElementById('status');
+  var $join = document.getElementById('join');
+  function say(t) { $status.textContent = t; }
+
+  /* ---------- Matrix widget transport (postMessage protocol) ---------- */
+  var reqCount = 0;
+
+  function toClient(msg) { window.parent.postMessage(msg, parentOrigin); }
+
+  function request(action, data) {
+    toClient({ api: 'fromWidget', widgetId: widgetId,
+               requestId: 'w' + (++reqCount) + '-' + me, action: action, data: data || {} });
+  }
+
+  function sendSync(content) {
+    content.sender = me;
+    content.ts = Date.now();
+    request('send_event', { type: EVENT_TYPE, content: content });
+  }
+
+  window.addEventListener('message', function (ev) {
+    if (ev.source !== window.parent) return;
+    var m = ev.data;
+    if (!m || m.api !== 'toWidget' || m.widgetId !== widgetId || m.response) return;
+
+    var reply = function (response) {
+      m.response = response;
+      toClient(m);
+    };
+
+    if (m.action === 'capabilities') {
+      reply({ capabilities: [
+        'org.matrix.msc2762.send.event:' + EVENT_TYPE,
+        'org.matrix.msc2762.receive.event:' + EVENT_TYPE
+      ] });
+    } else if (m.action === 'notify_capabilities') {
+      reply({});
+      say('Connected. Paste a link to start.');
+      sendSync({ kind: 'hello' });
+    } else if (m.action === 'send_event') {
+      reply({});
+      var e = m.data;
+      if (e && e.type === EVENT_TYPE && e.content && e.content.sender !== me) {
+        onRemote(e.content);
+      }
+    } else {
+      reply({});
+    }
+  });
+
+  /* ---------- YouTube player ---------- */
+  var player = null, playerReady = false, pending = null;
+  var joined = false;
+  var suppressUntil = 0;       // ignore player events we caused ourselves
+  var isLeader = false;        // last client to issue a control action
+  var lastT = 0, lastWall = Date.now();
+  var current = { videoId: null, rate: 1 };
+
+  function parseVideoId(s) {
+    var m = s.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([\w-]{11})/);
+    if (m) return m[1];
+    return /^[\w-]{11}$/.test(s.trim()) ? s.trim() : null;
+  }
+
+  function programmatic(fn) {
+    suppressUntil = Date.now() + 1500;
+    fn();
+  }
+
+  function snapshot() {
+    var st = playerReady ? player.getPlayerState() : -1;
+    return {
+      videoId: current.videoId,
+      playing: st === 1 || st === 3,
+      pos: playerReady ? player.getCurrentTime() : 0,
+      rate: playerReady ? player.getPlaybackRate() : 1
+    };
+  }
+
+  function broadcastState(kind) {
+    var s = snapshot();
+    if (!s.videoId) return;
+    isLeader = true;
+    s.kind = kind || 'state';
+    sendSync(s);
+  }
+
+  function applyState(s) {
+    if (!playerReady) { pending = s; return; }
+    if (!s.videoId) return;
+    // Estimate where the sender is now, if they were playing.
+    var target = s.pos;
+    if (s.playing && s.recvAt) target += (Date.now() - s.recvAt) / 1000 * s.rate;
+
+    programmatic(function () {
+      if (s.videoId !== current.videoId) {
+        current.videoId = s.videoId;
+        if (s.playing && joined) player.loadVideoById(s.videoId, target);
+        else player.cueVideoById(s.videoId, target);
+      } else {
+        if (Math.abs(player.getCurrentTime() - target) > DRIFT_LIMIT) player.seekTo(target, true);
+        if (player.getPlaybackRate() !== s.rate) player.setPlaybackRate(s.rate);
+        var st = player.getPlayerState();
+        if (s.playing && st !== 1 && st !== 3 && joined) player.playVideo();
+        if (!s.playing && st === 1) player.pauseVideo();
+      }
+    });
+    lastT = target; lastWall = Date.now();
+    say(s.playing ? 'Playing in sync' : 'Paused');
+  }
+
+  function onRemote(c) {
+    if (c.kind === 'hello') {
+      // Anyone with a video answers, staggered to limit duplicates.
+      if (current.videoId) setTimeout(function () { broadcastState('state'); }, Math.random() * 800);
+      return;
+    }
+    if (c.kind === 'state') {
+      isLeader = false;
+      c.recvAt = Date.now();
+      applyState(c);
+    }
+  }
+
+  window.onYouTubeIframeAPIReady = function () {
+    player = new YT.Player('player', {
+      width: '100%', height: '100%',
+      playerVars: { playsinline: 1, rel: 0, origin: location.origin },
+      events: {
+        onReady: function () {
+          playerReady = true;
+          if (pending) { var p = pending; pending = null; applyState(p); }
+        },
+        onStateChange: function (e) {
+          if (Date.now() < suppressUntil) return;
+          if (e.data === 1 || e.data === 2) broadcastState('state'); // play / pause
+        },
+        onPlaybackRateChange: function () {
+          if (Date.now() < suppressUntil) return;
+          broadcastState('state');
+        },
+        onError: function (e) {
+          say(e.data === 101 || e.data === 150
+            ? 'The owner of this video blocks embedding. Try another.'
+            : 'Player error ' + e.data);
+        }
+      }
+    });
+  };
+
+  // Seek detection: a position jump the player did not explain.
+  setInterval(function () {
+    if (!playerReady || !current.videoId) return;
+    var now = Date.now();
+    var st = player.getPlayerState();
+    var playing = st === 1;
+    var expected = lastT + (playing ? (now - lastWall) / 1000 * player.getPlaybackRate() : 0);
+    var actual = player.getCurrentTime();
+    if (now > suppressUntil && Math.abs(actual - expected) > DRIFT_LIMIT) broadcastState('state');
+    lastT = actual; lastWall = now;
+  }, 500);
+
+  // Leader heartbeat so everyone else can correct drift.
+  setInterval(function () {
+    if (isLeader && playerReady && player.getPlayerState() === 1) broadcastState('state');
+  }, HEARTBEAT_MS);
+
+  /* ---------- UI ---------- */
+  document.getElementById('joinBtn').addEventListener('click', function () {
+    joined = true;                 // a user gesture lets the browser allow playback
+    $join.hidden = true;
+    if (playerReady && current.videoId) {
+      programmatic(function () { player.playVideo(); });
+    }
+  });
+
+  document.getElementById('load').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var id = parseVideoId(document.getElementById('url').value);
+    if (!id) { say('That does not look like a YouTube link.'); return; }
+    if (!joined) { joined = true; $join.hidden = true; }
+    current.videoId = id;
+    programmatic(function () { player.loadVideoById(id, 0); });
+    lastT = 0; lastWall = Date.now();
+    isLeader = true;
+    sendSync({ kind: 'state', videoId: id, playing: true, pos: 0, rate: 1 });
+    say('Playing for everyone');
+  });
+
+  /* ---------- Boot ---------- */
+  if (!widgetId) {
+    say('Open this page as a Matrix widget (widgetId missing from the URL).');
+  } else {
+    var tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+    request('content_loaded');
+  }
+})();
+</script>
+</body>
+</html>
