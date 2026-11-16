@@ -43,6 +43,16 @@
            background:var(--surface); color:var(--muted); pointer-events:none; }
   #empty[hidden], #join[hidden] { display:none; }
   #empty strong { color:var(--fg); font-size:17px; }
+  #foot { display:flex; align-items:center; gap:10px; padding:0 14px 12px; }
+  #foot button { padding:6px 12px; font-size:13px; background:var(--surface); color:var(--fg);
+                 border:1px solid var(--line); }
+  #foot button.on { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
+  #hint { color:var(--muted); font-size:12px; }
+  .ver { cursor:pointer; }
+  #dbg { position:absolute; left:8px; right:8px; bottom:8px; z-index:4; margin:0; padding:8px;
+         border-radius:8px; background:rgba(0,0,0,.85); color:#9ee7ff;
+         font:11px/1.35 ui-monospace, Menlo, Consolas, monospace; white-space:pre-wrap; }
+  #dbg[hidden] { display:none; }
   #skip { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); z-index:3;
           background:var(--surface); color:var(--fg); border:1px solid var(--line); }
   #join { position:absolute; inset:0; z-index:2; display:flex; align-items:center;
@@ -63,13 +73,15 @@
   <div id="empty"><strong>Nothing playing yet</strong><span>Paste a YouTube link above to start for the whole room.</span></div>
   <div id="player"></div>
   <button id="skip" type="button" hidden>Start anyway</button>
+  <pre id="dbg" hidden></pre>
   <div id="join"><button id="joinBtn" type="button">Join the watch party</button></div>
 </div>
+<div id="foot"><button id="adbtn" type="button">My ad is not detected</button><span id="hint">Tap the version tag for debug info</span></div>
 <script>
 (function () {
   'use strict';
 
-  var VERSION = '1.5 (low-traffic lockstep, 2026-11-14)';
+  var VERSION = '3.1 (skips + ads fix, 2026-11-16)';
   document.getElementById('ver').textContent = 'v' + VERSION.split(' ')[0];
   document.getElementById('ver').title = 'Widget version ' + VERSION;
 
@@ -90,6 +102,9 @@
   var $empty = document.getElementById('empty');
   var $join = document.getElementById('join');
   var $skip = document.getElementById('skip');
+  var $dbg = document.getElementById('dbg');
+  var $adbtn = document.getElementById('adbtn');
+  $dbg.hidden = true;
   function say(t) {
     $status.textContent = t;
     $statusBox.classList.toggle('live', /^(Playing|Paused|Connected)/.test(t));
@@ -186,41 +201,141 @@
     request('send_event', { type: EVENT_TYPE, content: { kind: 'bye', sender: me, ts: Date.now() } });
   });
 
-  /* ---------- Player state ---------- */
-  var player = null, playerReady = false, pendingState = null;
+  /* ---------- Shared room state ---------- */
+  // One authoritative description of what the room is doing. Every change gets a higher
+  // revision number, so a stale or late message can never overwrite a newer one.
+  var R = { rev: 0, by: '', videoId: null, playing: false, pos: 0, rate: 1, at: Date.now() };
+  var player = null, playerReady = false;
   var joined = false, errored = false;
-  var suppressUntil = 0;
-  var isLeader = false;
-  var lastT = 0, lastWall = Date.now();
-  var current = { videoId: null };
-  var sharedPlaying = false;
-  var peers = {};                 // sender -> last 'info' message
-  var hold = false, holdSince = 0, readyAllSince = 0, loadAt = 0, wasReady = true;
-  var lastInfo = '', helloTimer = null, replyTimer = null;
+  var current = { videoId: null };       // what our player has loaded
+  var peers = {};                        // sender -> last 'info' message
+  var cdurOf = {};                       // longest duration ever seen per video: the video, not an ad
+  var myStatus = 'idle', prevStatus = 'idle';     // idle | loading | ad | ok
+  var frozen = false;                    // the room clock is stopped while somebody is in an ad
+  var holdSince = 0, readyAllSince = 0, loadAt = 0;
+  var suppressUntil = 0, quietUntil = 0, driftCount = 0;
+  var pausedByHold = false, weMuted = false, hintSince = 0, manualAd = false;
+  var lastT = 0, lastWall = Date.now(), lastInfo = '', replyTimer = null;
+
+  function newer(a, b) { return a.rev > b.rev || (a.rev === b.rev && a.by > b.by); }
+
+  // Where the room is right now.
+  function roomPos() {
+    if (R.playing && !frozen) return R.pos + (Date.now() - R.at) / 1000 * R.rate;
+    return R.pos;
+  }
+
+  // A real user action (load, play, pause, seek, speed): new revision, tell the room.
+  function act(patch) {
+    var s = { rev: R.rev + 1, by: me, videoId: R.videoId, playing: R.playing,
+              pos: roomPos(), rate: R.rate };
+    Object.keys(patch).forEach(function (k) { s[k] = patch[k]; });
+    R = { rev: s.rev, by: s.by, videoId: s.videoId, playing: s.playing, pos: s.pos, rate: s.rate, at: Date.now() };
+    s.kind = 'state';
+    sendSync(s);
+  }
 
   function parseVideoId(s) {
     var m = s.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([\w-]{11})/);
     if (m) return m[1];
     return /^[\w-]{11}$/.test(s.trim()) ? s.trim() : null;
   }
-
   function programmatic(fn) { suppressUntil = Date.now() + 1500; fn(); }
   function myDur() { return playerReady ? player.getDuration() : 0; }
   function isIdle() { return !playerReady || !current.videoId || errored || !joined; }
 
-  function snapshot() {
-    var st = playerReady ? player.getPlayerState() : -1;
-    return {
-      videoId: current.videoId,
-      playing: st === 1 || st === 3,
-      pos: playerReady ? player.getCurrentTime() : 0,
-      rate: playerReady ? player.getPlaybackRate() : 1,
-      dur: myDur()
-    };
+  /* ---------- Ad detection ---------- */
+  // Evidence 1: during an ad the player reports the ad's length, shorter than the video.
+  // Evidence 2: an undocumented player method, only a hint (it can lag).
+  // Evidence 3: the person pressed the manual button.
+  function adHint() {
+    try {
+      if (playerReady && typeof player.getAdState === 'function') {
+        var a = player.getAdState();
+        if (a === 1) return true;
+        if (a === -1) return false;
+      }
+    } catch (e) {}
+    return null;
   }
 
-  /* ---------- Who is ready? ---------- */
-  // Ads are shorter than the video, so the longest length anyone reports is the real one.
+  function computeStatus() {
+    if (isIdle()) return 'idle';
+    if (manualAd) return 'ad';
+    var d = myDur(), v = current.videoId;
+    if (!(d > 0)) return 'loading';
+    if (d > (cdurOf[v] || 0)) cdurOf[v] = d;
+    if (cdurOf[v] - d > 1.5) return 'ad';
+    if (adHint() === true) {
+      if (!hintSince) hintSince = Date.now();
+      if (Date.now() - hintSince < 120000) return 'ad';
+    } else {
+      hintSince = 0;
+    }
+    return 'ok';
+  }
+
+  /* ---------- Making the player follow the room ---------- */
+  function muteForHold() { try { if (!player.isMuted()) { player.mute(); weMuted = true; } } catch (e) {} }
+  function restoreAudio() { try { if (weMuted) { player.unMute(); weMuted = false; } } catch (e) {} }
+
+  function unfreeze() {
+    frozen = false; readyAllSince = 0; pausedByHold = false;
+    $skip.hidden = true;
+    restoreAudio();
+  }
+
+  // The one place that moves our player. It never touches the player during an ad:
+  // after the ad we call it again and the player is put back to where the room is.
+  function reconcile(tol) {
+    if (isIdle() || myStatus !== 'ok') return;
+    var pos = roomPos(), st = player.getPlayerState();
+    var wantPlay = R.playing && !frozen;
+    quietUntil = Date.now() + 2000;
+    programmatic(function () {
+      if (Math.abs(player.getCurrentTime() - pos) > tol) player.seekTo(pos, true);
+      if (player.getPlaybackRate() !== R.rate) player.setPlaybackRate(R.rate);
+      if (wantPlay && st !== 1 && st !== 3) player.playVideo();
+      if (!wantPlay && (st === 1 || st === 3)) {
+        if (frozen) pausedByHold = true;
+        player.pauseVideo();
+      }
+    });
+    lastT = pos; lastWall = Date.now();
+  }
+
+  function loadVideo(id, pos, playing) {
+    var now = Date.now();
+    current.videoId = id;
+    errored = false; manualAd = false; loadAt = now;
+    myStatus = 'loading'; prevStatus = 'loading';
+    quietUntil = now + 2500;
+    $empty.hidden = true;
+    if (playing && joined) {
+      frozen = true; holdSince = now; readyAllSince = 0;   // everybody starts together
+      muteForHold();
+      programmatic(function () { player.loadVideoById(id, pos); });
+    } else {
+      unfreeze();
+      programmatic(function () { player.cueVideoById(id, pos); });
+    }
+    lastT = pos; lastWall = now;
+  }
+
+  function applyRoom(go) {
+    if (!playerReady || !joined) return;
+    if (R.videoId !== current.videoId) {
+      loadVideo(R.videoId, roomPos(), R.playing);
+      say('Starting for everyone\u2026');
+      return;
+    }
+    if (go) unfreeze();                                  // the barrier was released
+    else if (frozen && !R.playing) unfreeze();           // somebody paused during the wait
+    reconcile(0.5);
+    if (!frozen) say(R.playing ? 'Playing in sync' : 'Paused');
+  }
+
+  /* ---------- Messages from the room ---------- */
   function alivePeers() {
     var now = Date.now(), out = [];
     Object.keys(peers).forEach(function (id) {
@@ -231,99 +346,46 @@
     return out;
   }
 
-  function contentDur(sameVideo) {
-    var m = myDur();
-    sameVideo.forEach(function (p) { if (p.dur > m) m = p.dur; });
-    return m;
-  }
-
-  function close(a, b) { return a > 0 && Math.abs(a - b) <= 1.5; }
-
-  function isReady() {
-    if (isIdle()) return true;
-    var same = alivePeers().filter(function (p) { return p.videoId === current.videoId; });
-    return close(myDur(), contentDur(same));
-  }
-
   function sendInfo() {
-    sendSync({ kind: 'info', videoId: current.videoId, dur: myDur(),
-               idle: !playerReady || errored || !joined, hold: hold });
-  }
-
-  /* ---------- Sending room-wide state ---------- */
-  function broadcastState() {
-    var s = snapshot();
-    if (!s.videoId || !isReady()) return;
-    isLeader = true;
-    s.kind = 'state';
-    sharedPlaying = s.playing;
-    sendSync(s);
-  }
-
-  function applyState(s) {
-    if (!playerReady) { pendingState = s; return; }
-    if (!s.videoId) return;
-    var isNew = s.videoId !== current.videoId;
-    if (!isNew) {
-      var d = myDur();
-      if (d > 0 && s.dur > 0 && Math.abs(d - s.dur) > 1.5) return;   // we or they are in an ad
-    }
-    var target = s.pos;
-    if (s.playing && s.recvAt) target += (Date.now() - s.recvAt) / 1000 * s.rate;
-
-    hold = false; readyAllSince = 0;
-    programmatic(function () {
-      if (isNew) {
-        current.videoId = s.videoId;
-        errored = false;
-        loadAt = Date.now();
-        $empty.hidden = true;
-        if (s.playing && joined) {
-          player.loadVideoById(s.videoId, target);
-          hold = true; holdSince = Date.now();            // start together, not whenever we load
-        } else {
-          player.cueVideoById(s.videoId, target);
-        }
-      } else {
-        var limit = s.kind === 'state' ? 0.4 : DRIFT_LIMIT;
-        if (Math.abs(player.getCurrentTime() - target) > limit) player.seekTo(target, true);
-        if (player.getPlaybackRate() !== s.rate) player.setPlaybackRate(s.rate);
-        var st = player.getPlayerState();
-        if (s.playing && st !== 1 && st !== 3 && joined) player.playVideo();
-        if (!s.playing && st === 1) player.pauseVideo();
-      }
-    });
-    lastT = target; lastWall = Date.now();
-    sharedPlaying = s.playing;
-    if (!hold) say(s.playing ? 'Playing in sync' : 'Paused');
+    sendSync({ kind: 'info', videoId: current.videoId, status: myStatus,
+               cdur: cdurOf[current.videoId] || 0, frozen: frozen, fpos: R.pos, rev: R.rev,
+               idle: !playerReady || errored || !joined });
   }
 
   function onRemote(c) {
     c.recvAt = Date.now();
-    if (c.kind === 'hello' || c.kind === 'state') {
-      var pr = peers[c.sender];
-      if (!pr) pr = peers[c.sender] = { videoId: null, dur: 0, idle: false, hold: false };
-      pr.seen = c.recvAt;
-      if (c.kind === 'state') { pr.videoId = c.videoId; if (c.dur > 0) pr.dur = c.dur; pr.hold = false; }
+    var pr = peers[c.sender];
+    if (!pr && c.kind !== 'bye') {
+      pr = peers[c.sender] = { videoId: null, status: 'loading', cdur: 0, frozen: false, fpos: 0, rev: 0, idle: false };
     }
+    if (pr) pr.seen = c.recvAt;
+
     if (c.kind === 'hello') {
       // One late, random answer from whoever is ready; cancelled if someone else answers first.
-      if (current.videoId && !hold && isReady()) {
+      if (R.videoId && R.rev > 0 && !frozen && myStatus === 'ok') {
         clearTimeout(replyTimer);
-        replyTimer = setTimeout(function () { broadcastState(); }, 400 + Math.random() * 1200);
+        replyTimer = setTimeout(function () {
+          sendSync({ kind: 'state', rev: R.rev, by: R.by, videoId: R.videoId,
+                     playing: R.playing, pos: roomPos(), rate: R.rate });
+        }, 400 + Math.random() * 1200);
       }
     } else if (c.kind === 'info') {
       c.seen = c.recvAt;
       peers[c.sender] = c;
+      if (c.videoId && c.cdur > (cdurOf[c.videoId] || 0)) cdurOf[c.videoId] = c.cdur;
     } else if (c.kind === 'bye') {
       delete peers[c.sender];
     } else if (c.kind === 'state') {
       clearTimeout(replyTimer);
-      isLeader = false;
-      applyState(c);
+      pr.videoId = c.videoId;
+      if (!newer(c, R)) return;                          // stale or duplicate: ignore
+      R = { rev: c.rev, by: c.by, videoId: c.videoId, playing: c.playing,
+            pos: c.pos, rate: c.rate || 1, at: c.recvAt };
+      applyRoom(!!c.go);
     }
   }
 
+  /* ---------- Player events: only real user actions become room actions ---------- */
   window.onYouTubeIframeAPIReady = function () {
     player = new YT.Player('player', {
       width: '100%', height: '100%',
@@ -331,16 +393,24 @@
       events: {
         onReady: function () {
           playerReady = true;
-          if (pendingState) { var p = pendingState; pendingState = null; applyState(p); }
+          if (R.videoId) applyRoom(false);
         },
         onStateChange: function (e) {
-          if (hold || Date.now() < suppressUntil) return;
-          if (e.data === 1 && !sharedPlaying) broadcastState();
-          else if (e.data === 2 && sharedPlaying) broadcastState();
+          var now = Date.now();
+          if (frozen || now < suppressUntil) return;     // our own move, not the user's
+          myStatus = computeStatus();
+          if (myStatus !== 'ok') return;                 // events during ads are not the user's
+          checkSeek();                                   // a skip shows up as a jump right here
+          if (e.data === 1 && !R.playing) act({ playing: true, pos: player.getCurrentTime() });
+          else if (e.data === 2 && R.playing) act({ playing: false, pos: player.getCurrentTime() });
         },
         onPlaybackRateChange: function () {
-          if (hold || Date.now() < suppressUntil) return;
-          broadcastState();
+          var now = Date.now();
+          if (frozen || now < suppressUntil) return;
+          myStatus = computeStatus();
+          if (myStatus === 'ok' && player.getPlaybackRate() !== R.rate) {
+            act({ rate: player.getPlaybackRate(), pos: player.getCurrentTime() });
+          }
         },
         onError: function (e) {
           errored = true;
@@ -352,78 +422,115 @@
     });
   };
 
-  // Seek detection: a position jump the player did not explain.
-  setInterval(function () {
+  // A seek is a jump the player did not explain. After ads, while waiting, and right after
+  // we moved the player ourselves, jumps are not seeks and are never reported.
+  // Checked every 250 ms AND the instant the player reports a state change, because a skip
+  // can be followed by an ad within a fraction of a second and must be noticed before it.
+  function checkSeek() {
     if (!playerReady || !current.videoId) return;
     var now = Date.now();
-    var playing = player.getPlayerState() === 1;
-    var expected = lastT + (playing ? (now - lastWall) / 1000 * player.getPlaybackRate() : 0);
+    myStatus = computeStatus();
     var actual = player.getCurrentTime();
-    if (!hold && now > suppressUntil && Math.abs(actual - expected) > DRIFT_LIMIT) broadcastState();
+    if (frozen || myStatus !== 'ok' || now < quietUntil || now < suppressUntil) {
+      lastT = actual; lastWall = now;
+      return;
+    }
+    var st = player.getPlayerState();
+    var expected = lastT + (st === 1 ? (now - lastWall) / 1000 * player.getPlaybackRate() : 0);
+    if (Math.abs(actual - expected) > DRIFT_LIMIT) {
+      act({ pos: actual, playing: st === 1 || st === 3 });
+    }
     lastT = actual; lastWall = now;
-  }, 500);
+  }
+  setInterval(checkSeek, 250);
 
-  /* ---------- Lockstep: nobody plays ahead of anybody ---------- */
-  function doResume() {
-    hold = false; readyAllSince = 0; $skip.hidden = true;
-    var s = snapshot();                          // our own paused position
-    programmatic(function () { player.playVideo(); });
-    s.playing = true; s.kind = 'state';
-    sharedPlaying = true; isLeader = true;
-    sendSync(s);
-    lastT = s.pos; lastWall = Date.now();
+  /* ---------- The barrier: the room clock stops while anybody is in an ad or loading ---------- */
+  function doGo(pos) {
+    act({ playing: true, pos: pos, go: true });
+    unfreeze();
+    reconcile(0.4);
     say('Playing in sync');
   }
 
   function tick() {
     if (!playerReady) return;
     var now = Date.now();
-    if (isIdle()) { hold = false; $skip.hidden = true; return; }
+    myStatus = computeStatus();
+    if (isIdle()) { if (frozen) unfreeze(); prevStatus = myStatus; return; }
 
     var st = player.getPlayerState();
     var all = alivePeers();
-    var same = all.filter(function (p) { return p.videoId === current.videoId; });
-    var cd = contentDur(same);
-    var ready = close(myDur(), cd);
-    var unready = same.filter(function (p) { return !close(p.dur, cd); }).length + (ready ? 0 : 1);
-    // Peers that have not yet reported this video are still loading it.
-    var loading = now - loadAt < PENDING_MS
-      ? all.filter(function (p) { return p.videoId !== current.videoId; }).length : 0;
-    var waiting = unready + loading;
-    var anyHold = same.some(function (p) { return p.hold; });
+    var blocking = all.filter(function (p) {
+      if (p.ignored) return false;
+      if (p.videoId !== current.videoId) return now - loadAt < PENDING_MS;   // still loading it
+      return p.status !== 'ok';
+    });
+    var meBlocks = myStatus !== 'ok';
+    var waiting = blocking.length + (meBlocks ? 1 : 0);
 
     // Tell the room only when something about us changed.
-    var sig = [current.videoId, Math.round(myDur()), hold].join('|');
+    var sig = [current.videoId, myStatus, frozen, frozen ? Math.round(R.pos) : -1, R.rev,
+               Math.round(cdurOf[current.videoId] || 0)].join('|');
     if (sig !== lastInfo) { lastInfo = sig; sendInfo(); }
 
-    if (ready !== wasReady) {
-      wasReady = ready;
-      // We came out of an ad while the room kept playing: ask once, do not lead.
-      if (ready && !hold && !anyHold && same.length) {
-        clearTimeout(helloTimer);
-        helloTimer = setTimeout(function () { sendSync({ kind: 'hello' }); }, 300);
+    // Back from an ad: put the player where the room is, whatever YouTube resumed at.
+    if (prevStatus !== 'ok' && myStatus === 'ok') reconcile(0.5);
+    prevStatus = myStatus;
+
+    // Somebody is in an ad or loading while the room plays: stop the room clock.
+    if (!frozen && R.playing && waiting > 0 && all.length > 0) {
+      R.pos = roomPos(); R.at = now;
+      frozen = true; holdSince = now; readyAllSince = 0;
+      muteForHold();
+    }
+
+    if (!frozen) {
+      readyAllSince = 0; $skip.hidden = true;
+      // Catch up if we have been far from the room for a while (buffering, an undetected ad).
+      if (R.playing && myStatus === 'ok' && now > quietUntil && now > suppressUntil) {
+        var diff = Math.abs(player.getCurrentTime() - roomPos());
+        if (diff > 3) { if (++driftCount >= 3) { driftCount = 0; reconcile(0); } } else driftCount = 0;
+      } else {
+        driftCount = 0;
       }
+      return;
     }
 
-    if (!hold && waiting > 0 && all.length > 0 && sharedPlaying && (st === 1 || st === 3)) {
-      hold = true; holdSince = now;
+    // Frozen: wait paused at the frozen room position. An ad itself is never touched.
+    if (meBlocks) {
+      restoreAudio();                                   // you should hear your own ad
+      if (pausedByHold && st === 2) {                   // never leave an ad paused by us
+        pausedByHold = false;
+        programmatic(function () { player.playVideo(); });
+      }
+    } else {
+      reconcile(0.5);
     }
-    if (!hold) { readyAllSince = 0; $skip.hidden = true; return; }
-
-    // Holding: pause. (An ad cannot be paused, so we only pause once we are past it.)
-    if (ready && (st === 1 || st === 3)) programmatic(function () { player.pauseVideo(); });
 
     if (waiting > 0) {
       readyAllSince = 0;
-      say('Waiting for ' + waiting + ' viewer' + (waiting > 1 ? 's' : '') + ' (ad or loading)\u2026');
+      say(meBlocks && !blocking.length
+        ? 'Your ad is playing. Everyone else is waiting for it.'
+        : 'Waiting for ' + waiting + ' viewer' + (waiting > 1 ? 's' : '') + ' (ad or loading)\u2026');
     } else {
       if (!readyAllSince) readyAllSince = now;
       if (now - readyAllSince > (all.length ? 700 : 0)) {
-        var ids = [me];
-        same.forEach(function (p) { if (p.hold) ids.push(p.id); });
-        ids.sort();
-        if (ids[0] === me || now - readyAllSince > 5000) doResume();
-        else say('Starting together\u2026');
+        var holders = [{ id: me, fpos: R.pos, rev: R.rev }];
+        all.forEach(function (p) {
+          if (p.videoId === current.videoId && p.frozen && !p.ignored) holders.push({ id: p.id, fpos: p.fpos, rev: p.rev });
+        });
+        var late = now - readyAllSince > 6000;
+        // Everyone must agree on which revision of the room they froze (a skip may be in flight).
+        var agree = late || holders.every(function (h) { return h.rev === R.rev; });
+        holders.sort(function (a, b) { return a.id < b.id ? -1 : 1; });
+        if (agree && (holders[0].id === me || now - readyAllSince > 5000)) {
+          // Restart from the earliest frozen position of this revision: nobody is ahead.
+          var pos = R.pos;
+          holders.forEach(function (h) { if ((late || h.rev === R.rev) && h.fpos < pos) pos = h.fpos; });
+          doGo(pos);
+        } else {
+          say('Starting together\u2026');
+        }
       }
     }
     $skip.hidden = !(now - holdSince > 8000);
@@ -431,12 +538,24 @@
   setInterval(tick, 500);
 
   /* ---------- UI ---------- */
-  $skip.addEventListener('click', function () { if (hold) doResume(); });
+  $skip.addEventListener('click', function () {
+    if (!frozen) return;
+    alivePeers().forEach(function (p) {
+      if (p.videoId !== current.videoId || p.status !== 'ok') p.ignored = true;   // stop waiting for them
+    });
+    if (myStatus !== 'ok') unfreeze(); else doGo(R.pos);
+  });
 
   document.getElementById('joinBtn').addEventListener('click', function () {
     joined = true;                 // a user gesture lets the browser allow playback
     $join.hidden = true;
-    if (playerReady && current.videoId) programmatic(function () { player.playVideo(); });
+    if (!playerReady) return;
+    if (R.videoId && current.videoId !== R.videoId) {
+      loadVideo(R.videoId, roomPos(), R.playing);
+    } else if (R.videoId) {
+      reconcile(0.5);
+    }
+    sendSync({ kind: 'hello' });   // ask where the room is
   });
 
   document.getElementById('load').addEventListener('submit', function (e) {
@@ -444,17 +563,40 @@
     var id = parseVideoId(document.getElementById('url').value);
     if (!id) { say('That does not look like a YouTube link.'); return; }
     if (!joined) { joined = true; $join.hidden = true; }
-    current.videoId = id;
-    errored = false;
-    loadAt = Date.now();
-    hold = true; holdSince = loadAt; readyAllSince = 0;   // everyone starts together
-    sharedPlaying = true; isLeader = true;
-    $empty.hidden = true;
-    programmatic(function () { player.loadVideoById(id, 0); });
-    lastT = 0; lastWall = Date.now();
-    sendSync({ kind: 'state', videoId: id, playing: true, pos: 0, rate: 1, dur: 0 });
+    act({ videoId: id, playing: true, pos: 0 });
+    loadVideo(id, 0, true);
     say('Starting for everyone\u2026');
   });
+
+  function setAdButton() {
+    $adbtn.textContent = manualAd ? 'My ad is over' : 'My ad is not detected';
+    $adbtn.classList.toggle('on', manualAd);
+  }
+  $adbtn.addEventListener('click', function () {
+    if (!current.videoId) return;
+    manualAd = !manualAd;
+    setAdButton();
+    if (manualAd) say('Marked as watching an ad. Everyone else waits.');
+  });
+
+  // Tap the version tag to see what the player really reports (helps tune ad detection).
+  document.getElementById('ver').addEventListener('click', function () { $dbg.hidden = !$dbg.hidden; });
+
+  function dbgRefresh() {
+    if ($dbg.hidden || !playerReady) return;
+    var o = {};
+    try { o.state = player.getPlayerState(); } catch (e) {}
+    try { o.time = +player.getCurrentTime().toFixed(1); } catch (e) {}
+    try { o.dur = player.getDuration(); } catch (e) {}
+    o.cdur = cdurOf[current.videoId] || 0;
+    try { o.adState = typeof player.getAdState === 'function' ? player.getAdState() : 'no such method'; } catch (e) { o.adState = 'error'; }
+    try { var vd = player.getVideoData(); o.vdId = vd && vd.video_id; } catch (e) {}
+    o.status = myStatus; o.manual = manualAd; o.frozen = frozen;
+    o.room = 'rev ' + R.rev + ' pos ' + roomPos().toFixed(1) + (R.playing ? ' playing' : ' paused');
+    o.peers = Object.keys(peers).map(function (id) { return id.slice(0, 3) + ':' + peers[id].status; }).join(' ');
+    $dbg.textContent = Object.keys(o).map(function (k) { return k + ': ' + o[k]; }).join('\n');
+  }
+  setInterval(dbgRefresh, 500);
 
   /* ---------- Boot ---------- */
   if (!widgetId) {
