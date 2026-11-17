@@ -81,7 +81,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '3.1 (skips + ads fix, 2026-11-16)';
+  var VERSION = '3.2 (debug log + blocked-autoplay guard, 2026-11-16)';
   document.getElementById('ver').textContent = 'v' + VERSION.split(' ')[0];
   document.getElementById('ver').title = 'Widget version ' + VERSION;
 
@@ -136,6 +136,7 @@
     if (content.kind === 'state' || content.kind === 'info') {
       queue = queue.filter(function (q) { return q.kind !== content.kind; });
     }
+    logEv('>', content);
     queue.push(content);
     pump();
   }
@@ -214,6 +215,14 @@
   var frozen = false;                    // the room clock is stopped while somebody is in an ad
   var holdSince = 0, readyAllSince = 0, loadAt = 0;
   var suppressUntil = 0, quietUntil = 0, driftCount = 0;
+  var logLines = [], sawPlaying = false, blockedSince = 0, bootAt = Date.now();
+  function logEv(dir, c) {
+    var t = Math.round((Date.now() - bootAt) / 1000) + 's';
+    logLines.push(t + ' ' + dir + ' ' + c.kind + (c.rev !== undefined ? ' r' + c.rev : '') +
+      (c.status ? ' ' + c.status : '') + (c.playing !== undefined ? (c.playing ? ' play' : ' pause') : '') +
+      (c.go ? ' GO' : '') + (c.frozen ? ' frozen' : '') + (typeof c.pos === 'number' ? ' @' + Math.round(c.pos) : ''));
+    if (logLines.length > 9) logLines.shift();
+  }
   var pausedByHold = false, weMuted = false, hintSince = 0, manualAd = false;
   var lastT = 0, lastWall = Date.now(), lastInfo = '', replyTimer = null;
 
@@ -295,7 +304,7 @@
     programmatic(function () {
       if (Math.abs(player.getCurrentTime() - pos) > tol) player.seekTo(pos, true);
       if (player.getPlaybackRate() !== R.rate) player.setPlaybackRate(R.rate);
-      if (wantPlay && st !== 1 && st !== 3) player.playVideo();
+      if (wantPlay && st !== 1 && st !== 3) { sawPlaying = false; player.playVideo(); }
       if (!wantPlay && (st === 1 || st === 3)) {
         if (frozen) pausedByHold = true;
         player.pauseVideo();
@@ -314,6 +323,7 @@
     if (playing && joined) {
       frozen = true; holdSince = now; readyAllSince = 0;   // everybody starts together
       muteForHold();
+      sawPlaying = false;
       programmatic(function () { player.loadVideoById(id, pos); });
     } else {
       unfreeze();
@@ -323,6 +333,7 @@
   }
 
   function applyRoom(go) {
+    if (playerReady && !joined && R.videoId) { say('The room is watching something. Click "Join the watch party" to start.'); return; }
     if (!playerReady || !joined) return;
     if (R.videoId !== current.videoId) {
       loadVideo(R.videoId, roomPos(), R.playing);
@@ -354,6 +365,7 @@
 
   function onRemote(c) {
     c.recvAt = Date.now();
+    logEv('<', c);
     var pr = peers[c.sender];
     if (!pr && c.kind !== 'bye') {
       pr = peers[c.sender] = { videoId: null, status: 'loading', cdur: 0, frozen: false, fpos: 0, rev: 0, idle: false };
@@ -397,12 +409,13 @@
         },
         onStateChange: function (e) {
           var now = Date.now();
+          if (e.data === 1) { sawPlaying = true; blockedSince = 0; }
           if (frozen || now < suppressUntil) return;     // our own move, not the user's
           myStatus = computeStatus();
           if (myStatus !== 'ok') return;                 // events during ads are not the user's
           checkSeek();                                   // a skip shows up as a jump right here
           if (e.data === 1 && !R.playing) act({ playing: true, pos: player.getCurrentTime() });
-          else if (e.data === 2 && R.playing) act({ playing: false, pos: player.getCurrentTime() });
+          else if (e.data === 2 && R.playing && sawPlaying) act({ playing: false, pos: player.getCurrentTime() });
         },
         onPlaybackRateChange: function () {
           var now = Date.now();
@@ -484,6 +497,10 @@
       muteForHold();
     }
 
+    if (!frozen && R.playing && myStatus === 'ok' && st !== 1 && st !== 3 && st !== 0 && now > suppressUntil) {
+      if (!blockedSince) blockedSince = now;
+      if (now - blockedSince > 3000) say('Playback was blocked by the browser. Click the video to start.');
+    } else if (st === 1) { blockedSince = 0; }
     if (!frozen) {
       readyAllSince = 0; $skip.hidden = true;
       // Catch up if we have been far from the room for a while (buffering, an undetected ad).
@@ -594,7 +611,8 @@
     o.status = myStatus; o.manual = manualAd; o.frozen = frozen;
     o.room = 'rev ' + R.rev + ' pos ' + roomPos().toFixed(1) + (R.playing ? ' playing' : ' paused');
     o.peers = Object.keys(peers).map(function (id) { return id.slice(0, 3) + ':' + peers[id].status; }).join(' ');
-    $dbg.textContent = Object.keys(o).map(function (k) { return k + ': ' + o[k]; }).join('\n');
+    $dbg.textContent = Object.keys(o).map(function (k) { return k + ': ' + o[k]; }).join('\n') +
+      '\n--- last events (> sent, < received)\n' + logLines.join('\n');
   }
   setInterval(dbgRefresh, 500);
 
