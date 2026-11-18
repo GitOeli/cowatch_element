@@ -81,14 +81,14 @@
 (function () {
   'use strict';
 
-  var VERSION = '3.3 (ad pods, no catch-up seeks, 2026-11-16)';
+  var VERSION = '3.4 (bounded traffic, 2026-11-16)';
   document.getElementById('ver').textContent = 'v' + VERSION.split(' ')[0];
   document.getElementById('ver').title = 'Widget version ' + VERSION;
 
   var EVENT_TYPE = 'io.cowatch.sync';
   var DRIFT_LIMIT = 1.5;        // seconds of drift tolerated on heartbeat-free corrections
   var PENDING_MS = 6000;        // how long we wait for peers to load a new video
-  var BUCKET_MAX = 9, BUCKET_REFILL_MS = 3000;   // Synapse default: burst 10, 1 per 5 s
+  var BUCKET_MAX = 7, BUCKET_REFILL_MS = 5500;   // 0.18/s: below Synapse's default 0.2/s, burst 7 of 10   // Synapse default: burst 10, 1 per 5 s
   var PEER_TTL = 20 * 60 * 1000;
   var me = Math.random().toString(36).slice(2);
 
@@ -138,7 +138,31 @@
     }
     logEv('>', content);
     queue.push(content);
+    // A control message never waits behind the spacing of a status message.
+    if (isUrgent(content) && sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
     pump();
+  }
+
+  var lastInfoAt = 0, infoTimes = [], sentTimes = [];
+  // Status messages are spaced at least this far apart; after a burst of them, much further.
+  function infoGap() {
+    var now = Date.now();
+    infoTimes = infoTimes.filter(function (t) { return now - t < 30000; });
+    return infoTimes.length > 4 ? 12000 : 4500;
+  }
+  // "Wait for me" (in an ad / loading) must reach the others at once; only bookkeeping is spaced out.
+  // If those urgent messages ever come in a storm (more than 6 in 30 s), they are spaced out too.
+  var urgentTimes = [];
+  function isUrgent(c) {
+    if (c.kind !== 'info') return true;
+    if (c.status === 'ok') return false;
+    var now = Date.now();
+    urgentTimes = urgentTimes.filter(function (t) { return now - t < 30000; });
+    return urgentTimes.length < 6;
+  }
+  function firstControl() {
+    for (var k = 0; k < queue.length; k++) if (isUrgent(queue[k])) return k;
+    return -1;
   }
 
   function pump() {
@@ -146,14 +170,20 @@
     var now = Date.now();
     refill();
     var wait = Math.max(tokens >= 1 ? 0 : (1 - tokens) * BUCKET_REFILL_MS, backoffUntil - now);
+    if (firstControl() < 0) wait = Math.max(wait, lastInfoAt + infoGap() - now);
     sendTimer = setTimeout(function () {
       sendTimer = null;
-      var i = 0;
-      for (var k = 0; k < queue.length; k++) {           // control messages first
-        if (queue[k].kind === 'state' || queue[k].kind === 'hello') { i = k; break; }
+      if (!queue.length) return;
+      var j = firstControl();
+      if (j < 0) {                                       // only a status message is waiting
+        if (Date.now() < lastInfoAt + infoGap()) { pump(); return; }
+        j = 0;
       }
-      var c = queue.splice(i, 1)[0];
+      var c = queue.splice(j, 1)[0];
       refill(); tokens -= 1;
+      var t = Date.now();
+      sentTimes.push(t);
+      if (c.kind === 'info') { if (c.status !== 'ok' && urgentTimes.length < 6) urgentTimes.push(t); else { lastInfoAt = t; infoTimes.push(t); } }
       inflight[request('send_event', { type: EVENT_TYPE, content: c })] = c;
       pump();
     }, wait);
@@ -169,8 +199,8 @@
       if (c && m.response) {
         delete inflight[m.requestId];
         if (m.response.error) {
-          backoffUntil = Date.now() + 8000;
-          if (!c.retried) { c.retried = true; queue.unshift(c); pump(); }
+          backoffUntil = Date.now() + 15000;
+          if (c.kind !== 'info' && !c.retried) { c.retried = true; queue.unshift(c); pump(); }
           say('Server is limiting messages, slowing down\u2026');
         }
       }
@@ -416,6 +446,7 @@
     var pr = peers[c.sender];
     if (!pr && c.kind !== 'bye') {
       pr = peers[c.sender] = { videoId: null, status: 'loading', cdur: 0, frozen: false, fpos: 0, rev: 0, idle: false };
+      lastInfo = '';                                     // tell the newcomer where we are, once
     }
     if (pr) pr.seen = c.recvAt;
 
@@ -534,9 +565,9 @@
 
     // Tell the room only when something about us changed.
     if (frozen && myStatus === 'ok' && st === 2) hpos = player.getCurrentTime(); else hpos = null;
-    var sig = [current.videoId, myStatus, frozen, frozen ? Math.round(R.pos) : -1, hpos === null ? -1 : Math.round(hpos), R.rev,
+    var sig = [current.videoId, myStatus, frozen, hpos !== null, frozen ? R.rev : 0,
                Math.round(cdurOf[current.videoId] || 0)].join('|');
-    if (sig !== lastInfo) { lastInfo = sig; sendInfo(); }
+    if (sig !== lastInfo && all.length > 0) { lastInfo = sig; sendInfo(); }
 
     // Back from an ad: put the player where the room is, whatever YouTube resumed at.
     if (prevStatus !== 'ok' && myStatus === 'ok' && !frozen) reconcile(1.0);
@@ -657,6 +688,8 @@
     try { var vd = player.getVideoData(); o.vdId = vd && vd.video_id; } catch (e) {}
     o.status = myStatus + (myStatus === 'ad' ? ' (' + adWhy + ')' : ''); o.manual = manualAd; o.frozen = frozen;
     o.room = 'rev ' + R.rev + ' pos ' + roomPos().toFixed(1) + (R.playing ? ' playing' : ' paused');
+    var nowT = Date.now();
+    o.sent = sentTimes.filter(function (t) { return nowT - t < 60000; }).length + ' events in the last minute (server allows ~12), queued ' + queue.length;
     o.peers = Object.keys(peers).map(function (id) { return id.slice(0, 3) + ':' + peers[id].status; }).join(' ');
     $dbg.textContent = Object.keys(o).map(function (k) { return k + ': ' + o[k]; }).join('\n') +
       '\n--- last events (> sent, < received)\n' + logLines.join('\n');
