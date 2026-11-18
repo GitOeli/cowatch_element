@@ -81,14 +81,14 @@
 (function () {
   'use strict';
 
-  var VERSION = '3.2 (debug log + blocked-autoplay guard, 2026-11-16)';
+  var VERSION = '3.3 (ad pods, no catch-up seeks, 2026-11-16)';
   document.getElementById('ver').textContent = 'v' + VERSION.split(' ')[0];
   document.getElementById('ver').title = 'Widget version ' + VERSION;
 
   var EVENT_TYPE = 'io.cowatch.sync';
   var DRIFT_LIMIT = 1.5;        // seconds of drift tolerated on heartbeat-free corrections
   var PENDING_MS = 6000;        // how long we wait for peers to load a new video
-  var BUCKET_MAX = 6, BUCKET_REFILL_MS = 4000;   // Synapse default: burst 10, 1 per 5 s
+  var BUCKET_MAX = 9, BUCKET_REFILL_MS = 3000;   // Synapse default: burst 10, 1 per 5 s
   var PEER_TTL = 20 * 60 * 1000;
   var me = Math.random().toString(36).slice(2);
 
@@ -221,10 +221,17 @@
     logLines.push(t + ' ' + dir + ' ' + c.kind + (c.rev !== undefined ? ' r' + c.rev : '') +
       (c.status ? ' ' + c.status : '') + (c.playing !== undefined ? (c.playing ? ' play' : ' pause') : '') +
       (c.go ? ' GO' : '') + (c.frozen ? ' frozen' : '') + (typeof c.pos === 'number' ? ' @' + Math.round(c.pos) : ''));
-    if (logLines.length > 9) logLines.shift();
+    if (logLines.length > 12) logLines.shift();
+  }
+  function logNote(text) {
+    logLines.push(Math.round((Date.now() - bootAt) / 1000) + 's * ' + text);
+    if (logLines.length > 12) logLines.shift();
   }
   var pausedByHold = false, weMuted = false, hintSince = 0, manualAd = false;
   var lastT = 0, lastWall = Date.now(), lastInfo = '', replyTimer = null;
+  var lastAdAt = 0, adWhy = '', lastStatusLogged = 'idle';
+  var offFlag = false, offSince = 0, offFlagAt = 0;   // our player is not following the room clock
+  var hpos = null;                                    // where our player really is while we wait
 
   function newer(a, b) { return a.rev > b.rev || (a.rev === b.rev && a.by > b.by); }
 
@@ -268,20 +275,60 @@
     return null;
   }
 
-  function computeStatus() {
+  var SETTLE_MS = 3000;   // after an ad, stay "in an ad" this long: covers the gap before the next ad of a pod
+
+  // Our player must follow the room clock. If it plays but sits far from it, the likeliest
+  // reason is an ad that the other evidence missed (its time counts from 0). Never fix that
+  // by seeking: seeking during an ad is useless and can start more ads.
+  function offClock() {
+    var now = Date.now();
+    if (!R.videoId || R.videoId !== current.videoId) { offFlag = false; offSince = 0; return false; }
+    var pos = player.getCurrentTime(), st = player.getPlayerState();
+    var off = Math.abs(pos - roomPos()) > 4;
+    if (offFlag) {
+      // Clear when the position makes sense again, or after 25 s (then the wait aligns everyone).
+      if (!off || now - offFlagAt > 25000) { offFlag = false; offSince = 0; }
+      return offFlag;
+    }
+    if (off && R.playing && !frozen && st === 1 && now > quietUntil + 1500 && now > suppressUntil && now - loadAt > 4000) {
+      if (!offSince) offSince = now;
+      if (now - offSince > 1500) { offFlag = true; offFlagAt = now; }
+    } else {
+      offSince = 0;
+    }
+    return offFlag;
+  }
+
+  function rawStatus() {
     if (isIdle()) return 'idle';
-    if (manualAd) return 'ad';
+    if (manualAd) { adWhy = 'button'; return 'ad'; }
     var d = myDur(), v = current.videoId;
     if (!(d > 0)) return 'loading';
     if (d > (cdurOf[v] || 0)) cdurOf[v] = d;
-    if (cdurOf[v] - d > 1.5) return 'ad';
+    if (cdurOf[v] - d > 1.5) { adWhy = 'length ' + Math.round(d) + ' vs ' + Math.round(cdurOf[v]); return 'ad'; }
+    try {
+      var vd = player.getVideoData();
+      if (vd && vd.video_id && vd.video_id !== v) { adWhy = 'video id differs'; return 'ad'; }
+    } catch (e) {}
     if (adHint() === true) {
       if (!hintSince) hintSince = Date.now();
-      if (Date.now() - hintSince < 120000) return 'ad';
+      if (Date.now() - hintSince < 120000) { adWhy = 'getAdState'; return 'ad'; }
     } else {
       hintSince = 0;
     }
+    if (offClock()) { adWhy = 'off the room clock'; return 'ad'; }
     return 'ok';
+  }
+
+  function computeStatus() {
+    var raw = rawStatus(), now = Date.now(), res = raw;
+    if (raw === 'ad') lastAdAt = now;
+    else if (raw === 'ok' && lastAdAt && now - lastAdAt < SETTLE_MS) { res = 'ad'; adWhy = 'settling after an ad'; }
+    if (res !== lastStatusLogged) {
+      logNote('status ' + lastStatusLogged + ' > ' + res + (res === 'ad' ? ' (' + adWhy + ')' : ''));
+      lastStatusLogged = res;
+    }
+    return res;
   }
 
   /* ---------- Making the player follow the room ---------- */
@@ -289,7 +336,7 @@
   function restoreAudio() { try { if (weMuted) { player.unMute(); weMuted = false; } } catch (e) {} }
 
   function unfreeze() {
-    frozen = false; readyAllSince = 0; pausedByHold = false;
+    frozen = false; readyAllSince = 0;
     $skip.hidden = true;
     restoreAudio();
   }
@@ -304,7 +351,7 @@
     programmatic(function () {
       if (Math.abs(player.getCurrentTime() - pos) > tol) player.seekTo(pos, true);
       if (player.getPlaybackRate() !== R.rate) player.setPlaybackRate(R.rate);
-      if (wantPlay && st !== 1 && st !== 3) { sawPlaying = false; player.playVideo(); }
+      if (wantPlay && st !== 1 && st !== 3) { sawPlaying = false; pausedByHold = false; player.playVideo(); }
       if (!wantPlay && (st === 1 || st === 3)) {
         if (frozen) pausedByHold = true;
         player.pauseVideo();
@@ -342,7 +389,7 @@
     }
     if (go) unfreeze();                                  // the barrier was released
     else if (frozen && !R.playing) unfreeze();           // somebody paused during the wait
-    reconcile(0.5);
+    reconcile(go ? 1.0 : 0.5);
     if (!frozen) say(R.playing ? 'Playing in sync' : 'Paused');
   }
 
@@ -359,7 +406,7 @@
 
   function sendInfo() {
     sendSync({ kind: 'info', videoId: current.videoId, status: myStatus,
-               cdur: cdurOf[current.videoId] || 0, frozen: frozen, fpos: R.pos, rev: R.rev,
+               cdur: cdurOf[current.videoId] || 0, frozen: frozen, fpos: R.pos, hpos: hpos, rev: R.rev,
                idle: !playerReady || errored || !joined });
   }
 
@@ -461,7 +508,7 @@
   function doGo(pos) {
     act({ playing: true, pos: pos, go: true });
     unfreeze();
-    reconcile(0.4);
+    reconcile(1.0);
     say('Playing in sync');
   }
 
@@ -472,6 +519,10 @@
     if (isIdle()) { if (frozen) unfreeze(); prevStatus = myStatus; return; }
 
     var st = player.getPlayerState();
+    if (pausedByHold && myStatus !== 'ok' && st === 2) {   // we paused something that turned out to be an ad
+      pausedByHold = false;
+      programmatic(function () { player.playVideo(); });
+    }
     var all = alivePeers();
     var blocking = all.filter(function (p) {
       if (p.ignored) return false;
@@ -482,12 +533,13 @@
     var waiting = blocking.length + (meBlocks ? 1 : 0);
 
     // Tell the room only when something about us changed.
-    var sig = [current.videoId, myStatus, frozen, frozen ? Math.round(R.pos) : -1, R.rev,
+    if (frozen && myStatus === 'ok' && st === 2) hpos = player.getCurrentTime(); else hpos = null;
+    var sig = [current.videoId, myStatus, frozen, frozen ? Math.round(R.pos) : -1, hpos === null ? -1 : Math.round(hpos), R.rev,
                Math.round(cdurOf[current.videoId] || 0)].join('|');
     if (sig !== lastInfo) { lastInfo = sig; sendInfo(); }
 
     // Back from an ad: put the player where the room is, whatever YouTube resumed at.
-    if (prevStatus !== 'ok' && myStatus === 'ok') reconcile(0.5);
+    if (prevStatus !== 'ok' && myStatus === 'ok' && !frozen) reconcile(1.0);
     prevStatus = myStatus;
 
     // Somebody is in an ad or loading while the room plays: stop the room clock.
@@ -503,13 +555,7 @@
     } else if (st === 1) { blockedSince = 0; }
     if (!frozen) {
       readyAllSince = 0; $skip.hidden = true;
-      // Catch up if we have been far from the room for a while (buffering, an undetected ad).
-      if (R.playing && myStatus === 'ok' && now > quietUntil && now > suppressUntil) {
-        var diff = Math.abs(player.getCurrentTime() - roomPos());
-        if (diff > 3) { if (++driftCount >= 3) { driftCount = 0; reconcile(0); } } else driftCount = 0;
-      } else {
-        driftCount = 0;
-      }
+      driftCount = 0;
       return;
     }
 
@@ -521,7 +567,8 @@
         programmatic(function () { player.playVideo(); });
       }
     } else {
-      reconcile(0.5);
+      var stNow = player.getPlayerState();
+      if (stNow === 1 || stNow === 3) { pausedByHold = true; programmatic(function () { player.pauseVideo(); }); }
     }
 
     if (waiting > 0) {
@@ -532,9 +579,9 @@
     } else {
       if (!readyAllSince) readyAllSince = now;
       if (now - readyAllSince > (all.length ? 700 : 0)) {
-        var holders = [{ id: me, fpos: R.pos, rev: R.rev }];
+        var holders = [{ id: me, fpos: hpos !== null ? hpos : R.pos, rev: R.rev }];
         all.forEach(function (p) {
-          if (p.videoId === current.videoId && p.frozen && !p.ignored) holders.push({ id: p.id, fpos: p.fpos, rev: p.rev });
+          if (p.videoId === current.videoId && p.frozen && !p.ignored) holders.push({ id: p.id, fpos: typeof p.hpos === 'number' ? p.hpos : p.fpos, rev: p.rev });
         });
         var late = now - readyAllSince > 6000;
         // Everyone must agree on which revision of the room they froze (a skip may be in flight).
@@ -542,7 +589,7 @@
         holders.sort(function (a, b) { return a.id < b.id ? -1 : 1; });
         if (agree && (holders[0].id === me || now - readyAllSince > 5000)) {
           // Restart from the earliest frozen position of this revision: nobody is ahead.
-          var pos = R.pos;
+          var pos = (hpos !== null ? hpos : R.pos);
           holders.forEach(function (h) { if ((late || h.rev === R.rev) && h.fpos < pos) pos = h.fpos; });
           doGo(pos);
         } else {
@@ -608,7 +655,7 @@
     o.cdur = cdurOf[current.videoId] || 0;
     try { o.adState = typeof player.getAdState === 'function' ? player.getAdState() : 'no such method'; } catch (e) { o.adState = 'error'; }
     try { var vd = player.getVideoData(); o.vdId = vd && vd.video_id; } catch (e) {}
-    o.status = myStatus; o.manual = manualAd; o.frozen = frozen;
+    o.status = myStatus + (myStatus === 'ad' ? ' (' + adWhy + ')' : ''); o.manual = manualAd; o.frozen = frozen;
     o.room = 'rev ' + R.rev + ' pos ' + roomPos().toFixed(1) + (R.playing ? ' playing' : ' paused');
     o.peers = Object.keys(peers).map(function (id) { return id.slice(0, 3) + ':' + peers[id].status; }).join(' ');
     $dbg.textContent = Object.keys(o).map(function (k) { return k + ': ' + o[k]; }).join('\n') +
