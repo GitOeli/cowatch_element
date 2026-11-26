@@ -87,7 +87,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '4.0 (rebuilt around a barrier, 2026-11-16)';
+  var VERSION = '4.3 (length trust is not remembered while alone, 2026-11-26)';
   var verEl = document.getElementById('ver');
   verEl.textContent = 'v' + VERSION.split(' ')[0];
   verEl.title = 'Widget version ' + VERSION;
@@ -399,6 +399,19 @@
     }
   }
 
+  var TRUST_LONG = 45;       // an ad is rarely longer than this
+  var TRUST_FALLBACK = 30000; // nobody corroborated: after this long, believe the player
+  var trustedDur = {};       // video id -> the duration we have decided is the video itself
+  var curPeers = [];
+  function lengthTrusted(d, now) {
+    var v = current.videoId;
+    if (trustedDur[v] && Math.abs(trustedDur[v] - d) <= 1.5) return true;
+    var strong = d > TRUST_LONG || now - loadAt > TRUST_FALLBACK ||
+      curPeers.some(function (p) { return !p.away && !p.loading && p.vid === v && p.dur > 0 && Math.abs(p.dur - d) <= 1.5; });
+    if (strong) trustedDur[v] = d;       // remembered
+    return strong || curPeers.length === 0;   // alone: nothing to coordinate, but not remembered: somebody may still show up
+  }
+
   function rawStatus() {
     if (isIdle()) return 'idle';
     if (manualAd) { adWhy = 'button'; return 'ad'; }
@@ -420,6 +433,8 @@
       hintSince = 0;
     }
     if (suspect) { adWhy = 'position far from the others'; return 'ad'; }
+    // Looks like the video, but it is short and nobody else sees it: it may be an ad. Touch nothing.
+    if (!lengthTrusted(d, Date.now())) { adWhy = 'length not confirmed'; return 'loading'; }
     return 'ok';
   }
   function computeStatus() {
@@ -447,7 +462,7 @@
   function loadVideo(id, pos, playing) {
     var now = Date.now();
     current.videoId = id;
-    errored = false; manualAd = false; suspect = false; sOffSince = 0; loadAt = now;
+    errored = false; manualAd = false; suspect = false; sOffSince = 0; loadAt = now; trustedDur[id] = 0;
     ap = -1; targetPos = pos; cpos = pos; cposAt = now; pendingSeek = null;
     myStatus = 'loading'; lastStatusLogged = 'loading';
     $empty.hidden = true;
@@ -513,7 +528,7 @@
       lastMxBeaconAt = 0; lastSig = '';                    // answer with a fresh status, right now
     } else if (c.kind === 'b') {
       p.vid = c.vid; p.away = !!c.away; p.loading = !!c.loading; p.idle = !!c.idle;
-      p.cpos = c.cpos; p.ap = c.ap; p.rev = c.rev; p.pl = !!c.pl; p.hold = !!c.hold;
+      p.cpos = c.cpos; p.ap = c.ap; p.rev = c.rev; p.pl = !!c.pl; p.hold = !!c.hold; p.dur = c.dur || 0;
       p.ignored = false;
       if (c.vid && c.cdur > (cdurOf[c.vid] || 0)) cdurOf[c.vid] = c.cdur;
       // Self-healing: somebody is behind on commands. Tell them again (rarely).
@@ -535,7 +550,7 @@
   function sendBeacon(now) {
     var b = { kind: 'b', vid: current.videoId, away: myStatus === 'ad', loading: myStatus === 'loading',
               idle: !playerReady || errored || !joined, cpos: cpos, ap: ap, rev: I.rev,
-              pl: phase === 'playing', hold: phase === 'syncing', cdur: cdurOf[current.videoId] || 0 };
+              pl: phase === 'playing', hold: phase === 'syncing', cdur: cdurOf[current.videoId] || 0, dur: myDur() };
     var sig = [b.vid, b.away, b.loading, b.idle, b.ap, b.hold].join('|');
     var changed = sig !== lastSig;
     if (changed) lastSig = sig;
@@ -593,6 +608,7 @@
     var now = Date.now();
     var st = player.getPlayerState(), cur = player.getCurrentTime();
     var P = present(now);
+    curPeers = P;
     ensureRtc(now);
 
     var ref = refPos(now, P);
