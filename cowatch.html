@@ -55,7 +55,8 @@
   .ver { cursor:pointer; }
   #dbg { position:absolute; left:8px; right:8px; bottom:8px; z-index:4; margin:0; padding:8px;
          border-radius:8px; background:rgba(0,0,0,.85); color:#9ee7ff;
-         font:11px/1.35 ui-monospace, Menlo, Consolas, monospace; white-space:pre-wrap; }
+         font:11px/1.35 ui-monospace, Menlo, Consolas, monospace; white-space:pre-wrap;
+         max-height:calc(100% - 16px); overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; user-select:text; }
   #dbg[hidden] { display:none; }
   #skip { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); z-index:3;
           background:var(--surface); color:var(--fg); border:1px solid var(--line); }
@@ -80,7 +81,7 @@
   <pre id="dbg" hidden></pre>
   <div id="join"><button id="joinBtn" type="button">Join the watch party</button></div>
 </div>
-<div id="ctl"><button id="bPlay" type="button" aria-label="Play or pause for everyone">&#9654;</button><button id="bBack" type="button" aria-label="Back 10 seconds">-10</button><input id="seek" type="range" min="0" max="1" value="0" aria-label="Position"><button id="bFwd" type="button" aria-label="Forward 10 seconds">+10</button><span id="time">0:00</span></div>
+<div id="ctl"><button id="bPlay" type="button" aria-label="Play or pause for everyone">&#9654;</button><button id="bBack" type="button" aria-label="Back 10 seconds">-10</button><input id="seek" type="range" min="0" max="1" value="0" aria-label="Position"><button id="bFwd" type="button" aria-label="Forward 10 seconds">+10</button><span id="time">0:00</span><button id="bFull" type="button" aria-label="Fullscreen">&#x26F6;</button></div>
 <div id="foot"><button id="adbtn" type="button">My ad is not detected</button><span id="hint">Tap the version tag for debug info. Use these controls, not the video, to play, pause or skip.</span></div>
 <script>
 (function () {
@@ -123,8 +124,9 @@
   var $time = document.getElementById('time');
   $dbg.hidden = true;
 
-  var lastSay = '';
+  var lastSay = '', warnText = '';     // a warning stays on screen until sending works again
   function say(t) {
+    if (warnText) t = warnText;
     if (t === lastSay) return;
     lastSay = t;
     $status.textContent = t;
@@ -134,7 +136,7 @@
   /* ---------- Matrix transport: few events, strictly paced ---------- */
   var reqCount = 0, inflight = {}, queue = [], sendTimer = null, backoffUntil = 0;
   var tokens = BUCKET_MAX, tokenAt = Date.now(), lastLowAt = 0, sentTimes = [];
-  var logLines = [], bootAt = Date.now();
+  var logLines = [], bootAt = Date.now(), refusals = 0;
 
   function logNote(text) {
     logLines.push(Math.round((Date.now() - bootAt) / 1000) + 's ' + text);
@@ -191,10 +193,14 @@
       var c = inflight[m.requestId];
       if (c && m.response) {
         delete inflight[m.requestId];
+        if (!m.response.error) { refusals = 0; warnText = ''; }
         if (m.response.error) {
           backoffUntil = Date.now() + 15000;
           if (c.urgent && !c.retried) { c.retried = true; queue.unshift(c); pump(); }
-          logNote('! send refused, backing off');
+          var why = m.response.error.message || JSON.stringify(m.response.error);
+          refusals++;
+          logNote('! Element refused to send (' + c.kind + '): ' + String(why).slice(0, 160));
+          if (refusals >= 2) warnText = 'Element refuses to send this widget\'s messages: ' + String(why).slice(0, 90) + '. Check the room for a red "messages could not be sent" bar and clear it, then reload.';
         }
       }
       return;
@@ -292,7 +298,7 @@
   var urgentTimes = [];
   function bcast(c, mode, urgent) {
     c.sender = me; c.ts = Date.now();
-    var ids = Object.keys(peers), needMx = ids.length === 0, json = null;
+    var ids = Object.keys(peers), needMx = false, json = null;
     ids.forEach(function (id) {
       var r = rtc[id];
       if (r && r.open) { try { json = json || JSON.stringify(c); r.dc.send(json); return; } catch (e) {} }
@@ -495,6 +501,7 @@
     if (via === 'dc') p.dcAt = now;
 
     if (c.kind === 'hello') {
+      lastMxBeaconAt = 0; lastSig = '';                    // the newcomer gets our status at once
       // One late, random answer from whoever is here. It is the current command plus our position.
       if (I.videoId) {
         clearTimeout(replyTimer);
@@ -687,6 +694,14 @@
   $play.addEventListener('click', function () { if (I.videoId && joined) publish({ playing: !I.playing, pos: cpos }); });
   $back.addEventListener('click', function () { if (I.videoId && joined) publish({ pos: Math.max(0, cpos - 10) }); });
   $fwd.addEventListener('click', function () { if (I.videoId && joined) publish({ pos: cpos + 10 }); });
+  document.getElementById('bFull').addEventListener('click', function () {
+    var d = document, el = d.documentElement;
+    var inFs = d.fullscreenElement || d.webkitFullscreenElement;
+    try {
+      var p = inFs ? (d.exitFullscreen || d.webkitExitFullscreen).call(d) : (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+      if (p && p.catch) p.catch(function () { say('Fullscreen is blocked here. Use the widget\'s own expand button in Element instead.'); });
+    } catch (e) { say('Fullscreen is blocked here. Use the widget\'s own expand button in Element instead.'); }
+  });
   $seek.addEventListener('input', function () { dragging = true; });
   $seek.addEventListener('change', function () { dragging = false; if (I.videoId && joined) publish({ pos: +$seek.value }); });
 
